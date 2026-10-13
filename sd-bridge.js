@@ -54,6 +54,15 @@ export const inject = ['tools']
 
 const PKG_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)))
 
+/** 本插件版本（读自己的 package.json，读不到就 null）。`sd_server status` 会带出来——排查「改完没生效」时先看它。 */
+const PLUGIN_VERSION = (() => {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(PKG_DIR, 'package.json'), 'utf8')).version
+  } catch {
+    return null
+  }
+})()
+
 const DEFAULTS = {
   /**
    * SD WebUI 安装目录（含 launch.py 与 venv/python）。
@@ -1904,6 +1913,9 @@ const serverTool = {
     return JSON.stringify(
       {
         ok: true,
+        // 跑的是哪一版：排查「改完没生效 / 面板没有」时第一眼要看的东西
+        pluginVersion: PLUGIN_VERSION,
+        configSchema: Config === undefined ? 'unavailable' : 'exported',
         state: probe.kind === 'ready' ? 'ready' : 'offline',
         baseUrl: baseUrl(),
         sdDir: cfg.sdDir || undefined,
@@ -1981,45 +1993,11 @@ function mapStringsDeep(value) {
 /** 设置面板分组命名空间 = 插件 id（cordis.patch.yml 的按 id 覆盖项语义不变）。 */
 const SETTINGS_NS = 'sd-bridge'
 
-/** 尝试加载配置 schema；全部途径失败返回 null（跳过注册，其余功能不受影响）。
- * 途径①：裸 import（插件被 Node 以 profile node_modules 真实路径加载时可用）。
- * 途径②：按常见位置扫 schemastery 的 lib/index.mjs——插件目录是符号链接时
- *   （如 profile node_modules → 工作区），Node 取 realpath 解析依赖，裸 import 必然落空，
- *   这里直接定位 DSH profile 里已随宿主安装的 schemastery 文件。 */
+/** 尝试加载配置 schema（0.1.x 的 settings.register 路径）；失败返回 null（跳过注册，其余功能不受影响）。 */
 async function tryLoadConfigSchema() {
-  const candidates = []
+  const z = await resolveSchemastery()
+  if (z === null) return null
   try {
-    const mod = await import('@deepseek-ai/schemastery')
-    candidates.push(mod && mod.default ? mod.default : mod)
-  } catch {
-    /* 途径① 落空 → 走途径② */
-  }
-  if (candidates.length === 0) {
-    try {
-      const path = await import('node:path')
-      const fs = await import('node:fs')
-      const os = await import('node:os')
-      const roots = [path.join(os.homedir(), '.dsh', 'profiles'), path.join(process.cwd(), 'node_modules')]
-      for (const root of roots) {
-        let dirs = []
-        try { dirs = fs.existsSync(root) && root.endsWith('profiles') ? fs.readdirSync(root).map((d) => path.join(root, d)) : [root] } catch { continue }
-        for (const dir of dirs) {
-          const hit = path.join(dir, 'node_modules', '@deepseek-ai', 'schemastery', 'lib', 'index.mjs')
-          if (fs.existsSync(hit)) {
-            candidates.push(await import(`file:///${hit.replace(/\\/g, '/')}`))
-            break
-          }
-        }
-        if (candidates.length) break
-      }
-    } catch {
-      /* 扫描失败 → 放弃注册 */
-    }
-  }
-  if (candidates.length === 0) return null
-  try {
-    const mod = candidates[0]
-    const z = mod && mod.default ? mod.default : mod
     return z.object({
       enabled: z
         .boolean()
@@ -2130,15 +2108,241 @@ function registerSettings(ctx, patchKeys) {
   })()
 }
 
+// ---------------------------------------------------------------------------
+// 插件 Config 声明（0.2.x：设置面板的表单从**插件自己的 Config**派生）
+//
+// 0.1.x 时代是插件把 (ns, schema) 注册给 settings 服务；0.2.x 的 settings 服务
+// （SettingsForms）**没有 register()**，改成 Loader 读插件导出的 Config schema，
+// 把标了 `.volatile()` 的字段投影成表单，面板改完**不重挂插件** —— Loader 直接把
+// 新值 commit 进同一个引用对象（`Volatile<T>.get()` 现取现得），下面的 cfg 访问器
+// 因此能做到「改完下一个工具调用即生效」。
+//
+// ⛔ 不能用静态 import '@deepseek-ai/schemastery'：本插件常以 `link:` 安装
+//   （profile/node_modules → 工作区），Node 按 realpath 解析依赖，静态 import 必然
+//   ERR_MODULE_NOT_FOUND，整个模块**加载即失败** → 插件激活不了（本机全部 link:
+//   插件都遵守这条）。所以用 top-level await + 动态 import（裸 import → 宿主真身
+//   → profile 兜底）；两条路都失败就 `Config = undefined`，Loader 当没有 schema，
+//   退回老行为，功能不受影响。
+// ---------------------------------------------------------------------------
+
+/** volatile 引用用**全局** Symbol 标记，因此跨 ESM/CJS 副本、跨不同 schemastery 实例都能识别。 */
+const VOLATILE_WRITE = Symbol.for('cosmokit.volatile.write')
+
+/** 是不是 0.2.x Loader 放进 config 的那种 volatile 引用对象。 */
+function isVolatileRef(value) {
+  return Boolean(value) && typeof value === 'object' && VOLATILE_WRITE in value
+}
+
+/** 取 volatile 引用的当前值（引用由 Loader 原地更新）；非引用原样返回。 */
+function volatileValue(value) {
+  if (!isVolatileRef(value)) return value
+  try {
+    return value.get()
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 把一个配置值规范化成 cfg 里该有的样子（补默认、钳制范围、解析 SD 目录）。
+ * 原先散在设置面板 pull() 与 apply() 里的那几行钳制收拢到这里，读写两侧共用一份规则，
+ * 顺带保证**重算只发生在引用真变了的时候**（detectSdDir 会扫盘，不能每次读 cfg 都跑）。
+ */
+function normalizeConfigValue(key, value) {
+  switch (key) {
+    case 'enabled':
+      return value !== false
+    case 'autoStart':
+      return value !== false
+    case 'port':
+      return clampInt(value, DEFAULTS.port, 1024, 65535)
+    case 'idleStopMinutes':
+      return Math.max(0, Math.trunc(Number(value) || 0))
+    case 'startupTimeoutMs':
+      return Math.max(30000, Math.trunc(Number(value) || DEFAULTS.startupTimeoutMs))
+    case 'requestTimeoutMs':
+      return Math.max(30000, Math.trunc(Number(value) || DEFAULTS.requestTimeoutMs))
+    case 'img2imgDenoising':
+      return Math.min(1, Math.max(0, Number(value) || DEFAULTS.img2imgDenoising))
+    case 'outputDir':
+      return String(value ?? DEFAULTS.outputDir).trim() || DEFAULTS.outputDir
+    case 'refDir':
+      return String(value ?? DEFAULTS.refDir).trim() || DEFAULTS.refDir
+    case 'extraArgs':
+      return Array.isArray(value) ? value.map((item) => String(item)) : []
+    case 'sdDir':
+      // 显式配置优先，为空/无效则自动探测（环境变量 / 自举记录 / 扫盘）
+      return detectSdDir(String(value ?? '').trim())
+    default:
+      return value === undefined || value === null ? DEFAULTS[key] : value
+  }
+}
+
+/**
+ * 把某个 cfg 键装成 volatile 访问器：读的时候现取引用的值（引用变了就重算并丢掉本进程的改写），
+ * 写的时候落成本进程的覆盖值。这样设置面板改完无需重挂插件、下一个工具调用就生效，
+ * 同时 apply() 里那几行 `cfg.x = 钳制后(cfg.x)` 也不会被吞掉。
+ */
+function installVolatileAccessor(holder, key, ref) {
+  let seen = Symbol('unset')
+  let normalized
+  let override
+  let hasOverride = false
+  Object.defineProperty(holder, key, {
+    enumerable: true,
+    configurable: true,
+    get() {
+      const fresh = volatileValue(ref)
+      if (!Object.is(fresh, seen)) {
+        seen = fresh
+        normalized = normalizeConfigValue(key, fresh)
+        override = undefined
+        hasOverride = false
+      }
+      return hasOverride ? override : normalized
+    },
+    set(value) {
+      override = value
+      hasOverride = true
+    },
+  })
+}
+
+/** 设置面板里每个字段的中文说明（沿用 0.1.x schema 的文案，一字未改）。 */
+const CONFIG_FIELD_DOCS = {
+  enabled: '注册生图工具（sd_txt2img 等 6 个）。关闭后需重开会话生效。',
+  sdDir:
+    'SD WebUI 安装目录（含 launch.py）。留空 = 自动探测：环境变量 DSH_SD_DIR > 自举安装记录 ~/.dsh-sd-bridge.json > 各盘常见目录扫描。',
+  port: 'SD API 端口，与 WebUI 默认端口一致（1024-65535，越界自动纠正）。',
+  autoStart: '探测不到已运行的 API 时，是否由插件自动以纯 API 模式（--api --nowebui）拉起 SD。',
+  startupTimeoutMs: '启动 SD 的最长等待毫秒数（首次还要加载 checkpoint，给足余量；默认 420000 = 7 分钟）。',
+  requestTimeoutMs: '单次生图请求的最长等待毫秒数（默认 600000 = 10 分钟，高清/大批量给足）。',
+  idleStopMinutes: '空闲多少分钟后自动关掉由本插件拉起的 SD；0 = 不自动关。',
+  extraArgs: '追加给 launch.py 的额外命令行参数（高级项，每项一个字符串）。',
+  outputDir: '生图产物目录：绝对路径原样使用；相对路径解析到会话工作区（默认 SD-Picture）。',
+  refDir: '图生图参考图固化目录（工作区外的聊天附件会复制到这里）；相对路径解析到会话工作区。',
+  defaultSampler:
+    '未指定采样器时的默认采样器；留空 = 交给 SD 自己的默认。DPM++ 2M 同样步数下比 Euler a 更干净。可用名见 sd_models。',
+  defaultNegative: '调用方没传 negativePrompt 时自动补的画质底线负面词；留空 = 不补（空负面会漏拦肢体崩/水印）。',
+  img2imgDenoising: '图生图默认重绘幅度 0-1：0.55 更贴参考图；保画风传 0.30-0.50，彻底重画传 0.70+。',
+}
+
+/**
+ * 把 DEFAULTS 声明成 0.2.x 的插件 Config：13 个字段全部 `.volatile()`（面板可实时编辑）。
+ *
+ * ⚠️ 每个字段都带 `.loose()`：手写 `cordis.patch.yml` 很容易把数字/布尔写成字符串
+ * （`port: "7860"`、`enabled: "false"`），而 0.2.x 的 `resolveConfig` 是**严格**校验、
+ * 失败就抛 ValidationError → **整个插件激活不了**。`.loose()` 让校验异常退回 schema
+ * 默认值：宁可某个字段悄悄用默认值，也绝不能让插件起不来（0.1.x 时代这里根本没有 schema，
+ * 所以「加 schema」绝不能变成新的启动风险）。
+ */
+function buildPluginConfigSchema(z) {
+  const docs = (key, node) => (CONFIG_FIELD_DOCS[key] ? node.description(CONFIG_FIELD_DOCS[key]) : node)
+  const bool = (key) => docs(key, z.boolean().default(DEFAULTS[key]).volatile().loose())
+  const num = (key) => docs(key, z.number().default(DEFAULTS[key]).volatile().loose())
+  const text = (key) => docs(key, z.string().default(DEFAULTS[key]).volatile().loose())
+  return z.object({
+    enabled: bool('enabled'),
+    sdDir: text('sdDir'),
+    port: num('port'),
+    autoStart: bool('autoStart'),
+    startupTimeoutMs: num('startupTimeoutMs'),
+    requestTimeoutMs: num('requestTimeoutMs'),
+    idleStopMinutes: num('idleStopMinutes'),
+    extraArgs: docs('extraArgs', z.array(z.string()).default(DEFAULTS.extraArgs).volatile().loose()),
+    outputDir: text('outputDir'),
+    refDir: text('refDir'),
+    defaultSampler: text('defaultSampler'),
+    defaultNegative: text('defaultNegative'),
+    img2imgDenoising: num('img2imgDenoising'),
+  })
+}
+
+/**
+ * 解析 schemastery —— 0.2.x 插件 Config 的唯一依赖。两条途径，全失败返回 null：
+ *   ① 裸 import：插件被 Node 以 profile node_modules **真实路径**加载时可用；
+ *   ② 按已知位置找 lib/index.mjs：插件是符号链接时（link: 安装）走这条 ——
+ *      先试 Electron 宿主真身 `app.asar/dsh/node_modules/...`，再扫 `~/.dsh/profiles/*`。
+ * 跨实例是安全的：volatile 引用靠 `Symbol.for` 互通，schema 靠 `'~standard'.vendor` 识别，
+ * 且本机这三处的 schemastery 逐字节相同（sha256 一致）。
+ */
+async function resolveSchemastery() {
+  /** 认出 schemastery 的默认导出（不同打包方式的形状不一样）。 */
+  const pick = (mod) => {
+    const z = mod && mod.default ? mod.default : mod
+    return z && typeof z.object === 'function' ? z : null
+  }
+  try {
+    const hit = pick(await import('@deepseek-ai/schemastery'))
+    if (hit) return hit
+  } catch {
+    /* 途径① 落空 → 走途径② */
+  }
+  try {
+    const path = await import('node:path')
+    const fs = await import('node:fs')
+    const os = await import('node:os')
+    const { pathToFileURL } = await import('node:url')
+    const tail = ['node_modules', '@deepseek-ai', 'schemastery', 'lib', 'index.mjs']
+    const candidates = []
+    // ②a 宿主真身（Electron 把 harness 打进 app.asar；路径含空格/中文，必须走 pathToFileURL）
+    const resources = process.resourcesPath
+    if (resources) candidates.push(path.join(resources, 'app.asar', 'dsh', ...tail))
+    // ②b profile 里随宿主安装/抽取的那份（再兜底当前工作目录）
+    try {
+      const root = path.join(os.homedir(), '.dsh', 'profiles')
+      if (fs.existsSync(root)) {
+        for (const dir of fs.readdirSync(root)) candidates.push(path.join(root, dir, ...tail))
+      }
+    } catch {
+      /* 列不出来就算了 */
+    }
+    candidates.push(path.join(process.cwd(), ...tail))
+    for (const hit of candidates) {
+      try {
+        if (!fs.existsSync(hit)) continue
+        const z = pick(await import(pathToFileURL(hit).href))
+        if (z) return z
+      } catch {
+        /* 这个候选不行 → 继续下一个 */
+      }
+    }
+  } catch {
+    /* 扫描失败 → 放弃 */
+  }
+  return null
+}
+
+/**
+ * 0.2.x 插件 Config。top-level await 保证 Loader 读 `runtime.Config` 时它已经就位
+ * （动态 import 的 promise 会等 TLA 跑完）；解析不到 schemastery 时导出 undefined，
+ * Loader 就当这个插件没有 schema，退回「无面板」的老行为。
+ */
+const configSchemastery = await resolveSchemastery()
+export const Config = configSchemastery === null ? undefined : buildPluginConfigSchema(configSchemastery)
+if (Config === undefined) {
+  log('schemastery 不可用（裸 import 与 profile/asar 兜底都没命中），跳过设置面板 schema——工具与技能照常')
+}
+
 export function apply(ctx, config = {}) {
   state.logger = ctx.logger ?? console
-  /** cordis.patch.yml 显式覆盖的键：优先级最高，设置面板不覆盖它们。 */
-  const patchKeys = new Set(
-    Object.keys(DEFAULTS).filter((key) => config && config[key] !== undefined && config[key] !== null),
-  )
+  /** cordis.patch.yml 显式覆盖的键（0.1.x 设置面板用；0.2.x 下优先级由 Loader 把关）。 */
+  const patchKeys = new Set()
+  /** 0.2.x：volatile 字段在 config 里是引用对象，装成访问器让面板改动即时生效。 */
+  const volatileRefs = new Map()
   for (const key of Object.keys(DEFAULTS)) {
-    if (config && config[key] !== undefined && config[key] !== null) cfg[key] = config[key]
+    const raw = config ? config[key] : undefined
+    if (isVolatileRef(raw)) {
+      volatileRefs.set(key, raw)
+      continue
+    }
+    if (raw !== undefined && raw !== null) {
+      patchKeys.add(key)
+      cfg[key] = raw
+    }
   }
+  for (const [key, ref] of volatileRefs) installVolatileAccessor(cfg, key, ref)
+
   cfg.port = clampInt(cfg.port, 7860, 1024, 65535)
   // sdDir：显式配置优先，为空则自动探测（环境变量 / 自举记录 / 扫盘）
   cfg.sdDir = detectSdDir(cfg.sdDir)

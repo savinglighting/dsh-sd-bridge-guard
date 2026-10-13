@@ -1,6 +1,6 @@
 {
   "name": "dsh-sd-bridge-guard",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "DeepSeek Harness 插件：本机 Stable Diffusion 生图六件套（文生图/图生图/蒙版重绘/只生成脚本/模型清单/服务管理）+ 违规分流协议。跨机器零适配——SD 目录自动探测，找不到可一键自举安装（先补齐 git/Python/VC++ 等环境），产物目录自动落在会话工作区；设置 → 插件可直接改配置。",
   "keywords": [
     "dsh",
@@ -25,10 +25,11 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node smoke-skill.mjs && node test-install-record.mjs && node test-settings.mjs && node test-install-catalog.mjs",
+    "test": "node smoke-skill.mjs && node test-install-record.mjs && node test-settings.mjs && node test-config-schema.mjs && node test-install-catalog.mjs",
     "test:smoke": "node smoke-skill.mjs",
     "test:record": "node test-install-record.mjs",
     "test:settings": "node test-settings.mjs",
+    "test:config": "node test-config-schema.mjs",
     "test:catalog": "node test-install-catalog.mjs",
     "acceptance": "node acceptance.mjs"
   },

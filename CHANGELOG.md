@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.7.1（适配 DSH 0.2.x 的配置表单）
+
+宿主 0.2.x 把「插件把 schema 注册给 settings 服务」换成了「表单从**插件自己的 Config** 派生」——
+`@deepseek-ai/dsh-settings` 0.2.0-rc.2 的 `SettingsForms` **没有 `register()`**，于是 0.7.0 的
+「设置 → 插件 → sd-bridge」在 0.2.x 上只剩一条日志、面板不出现（插件本身仍正常，工具与技能都在）。
+
+- **新增 `export const Config`（13 个字段全 `.volatile()`）**：走 0.2.x 新范式——Loader 读插件导出的 Config，把 volatile 字段投影成表单；面板改完**不重挂插件**，Loader 直接把新值 commit 进同一个引用对象。
+- **`apply()` 解包 volatile 引用 + 装访问器**：0.2.x 下 `config[key]` 是 `Volatile<T>` 引用（不是裸值），所以 ① 取值统一走 `.get()`；② 把 13 个键装成访问器，引用变了才重算，并按老规则钳制（port 1024-65535、denoising 0-1、startupTimeout ≥30s…）；`apply()` 里原有的钳制写回也不会被吞——**改完下一个工具调用即生效**。
+- **每个字段都带 `.loose()`**：手写 `cordis.patch.yml` 很容易把数字/布尔写成字符串（`port: "7860"`、`enabled: "false"`），而 0.2.x 的 `resolveConfig` 是**严格**校验、失败即抛 `ValidationError` → **整个插件激活不了**。`.loose()` 让校验异常退回 schema 默认值：宁可某个字段悄悄用默认值，也绝不能让插件起不来（0.1.x 时代这里根本没有 schema，所以「加 schema」绝不能变成新的启动风险）。
+- **仍然零静态依赖**：`Config` 用 **top-level await + 动态 import** 构造（裸 import → 宿主真身 `app.asar/dsh/node_modules/...` → `~/.dsh/profiles/*` 兜底），任一环节失败就导出 `undefined`、退回「没有 schema」的老行为。⛔ **绝不能写静态 `import '@deepseek-ai/schemastery'`**：插件以 `link:` 安装时 Node 按 realpath 解析依赖，静态 import 必然 `ERR_MODULE_NOT_FOUND`，**整个模块加载失败 → 插件激活不了**。
+- **路径一律走 `pathToFileURL`**：宿主真身在 `app.asar` 里，路径含空格与中文，手拼 `file:///` 会失败。
+- **0.1.x 兼容**：旧的 `tryLoadConfigSchema`（`settings.register` 路径）原样保留，只把「加载 schemastery」抽成公共的 `resolveSchemastery()`；0.1.x 上行为与 0.7.0 完全一致。
+- 新增 `test-config-schema.mjs`：Config 13 字段 + 全部 volatile + schema 默认值与 `DEFAULTS` 一致 + 解析后是引用对象 + 未知键不抛 + `apply` 解包正确 + **面板原地 commit 新值后 `cfg` 即时生效** + 越界钳制 + 工具仍注册 6 个。
+
 ## 0.7.0（设置入口 + 环境预检 + 资源清单化拉取）
 
 对着评论区反馈做的四件事：设置里找不到配置项、装机环境缺东西、模型拉取对象过时、缺常见 LoRA。

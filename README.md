@@ -94,7 +94,10 @@ powershell -ExecutionPolicy Bypass -File "插件目录\install-sd.ps1"
 
 ## 配置
 
-**推荐：设置 → 插件 → `sd-bridge`**（0.7.0 起注册了配置 schema，全部字段可视化编辑、带中文说明，改完下一个工具调用即生效）。也可在 `cordis.patch.yml` 中按 id `sd-bridge` 覆盖——**patch 层显式指定的键优先级最高，设置面板不会覆盖它们**。
+**推荐：设置 → 插件 → `sd-bridge`**（全部字段可视化编辑、带中文说明，改完下一个工具调用即生效）。也可在 `cordis.patch.yml` 中按 id `sd-bridge` 覆盖——**patch 层显式指定的键优先级最高，设置面板不会覆盖它们**。
+
+> **面板来自哪**：0.1.x 是插件把 `(ns, schema)` 注册给 settings 服务；**0.2.x 改成了「表单从插件自己的 Config 派生」**（`dsh-settings` 0.2.0-rc.2 的 `SettingsForms` 没有 `register()`），所以插件导出一份 13 字段全 `.volatile()` 的 `Config`，Loader 据此渲染表单，面板改完**不重挂插件**、原地 commit。两条路的代码都在，按宿主版本自动适用。
+> 解析不到 `schemastery`（非 DSH 环境、被裁剪的宿主）时 `Config` 导出 `undefined`，退回「只在 `cordis.patch.yml` 里改配置」的老行为，工具与技能不受影响。
 
 优先级：默认值 < 设置面板 < `cordis.patch.yml`。
 
@@ -157,7 +160,7 @@ npm run acceptance            # 真实出图验收：命名、序号、脚本字
 ## 常见问题
 
 - **新装的 SD 出图很差 / 发灰 / 不像样？** 是模型与 VAE，不是提示词：跑一遍 `install-sd.ps1`（会补装 **AWPainting v1.2** + `vae-ft-mse-840000` 并写质量默认配置，已装过 SD 也只会补缺的那部分），或先调 `sd_models`——它检测到只有新装默认的 SD1.5 base 会返回 `qualityHint`；动漫模型记得 CLIP skip = 2。
-- **设置里找不到插件配置？** 0.7.0 起在 **设置 → 插件 → `sd-bridge`** 注册了配置面板（13 个字段全可视化、带中文说明）；旧版只能改 `cordis.patch.yml`。若面板没有该项，说明还在跑旧版插件，重装最新版后新开会话。
+- **设置里找不到插件配置？** 面板有两种来源：**0.1.x** 靠插件向 settings 注册 schema；**0.2.x** 靠插件导出的 `Config`（13 个字段全 `.volatile()`）+ Loader 投影成表单。旧版插件在 0.2.x 上只会打一条「schemastery/注册跳过」日志、面板不出现（工具照常）——装 0.7.1 及以上即可。若依旧没有，先确认宿主版本与插件版本匹配，再新开一个会话；实在没有就改 `cordis.patch.yml`（见上表，功能完全等价）。
 - **想多装几个模型 / 常见 LoRA？** `install-sd.ps1 -Models "awpainting,majicmix" -Loras "add_detail,easynegative,badhandv4"`，键见上文参数表；已有文件会跳过，`-Upgrade` 做 sha 复验并补拉新版。
 - **安装时报缺 git / Python / VC++？** 不用手动补——0.7.0 起脚本先跑环境预检，缺啥自举啥（MinGit 便携版、官方 Python 3.10.6、vc_redist），每项失败只报一条错；也可 `-NoPrereq` 跳过整个预检。
 - **首次启动很慢？** 加载 checkpoint 约 1-3 分钟（可调大 `startupTimeoutMs`）；全新安装还要先在线装依赖。脚本自己拉起 SD 时会带 HF 缓存/镜像环境，tokenizer 不会去连 huggingface.co 反复重试。
